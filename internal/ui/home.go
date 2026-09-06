@@ -1198,7 +1198,7 @@ func (h *Home) getLayoutMode() string {
 func (h *Home) contentChromeTop() int {
 	top := 1 // header line
 	top++    // filter bar (always shown, matches View())
-	if h.shouldRenderUpdateNudge() {
+	if h.shouldRenderUpdateBanner() {
 		top++
 	}
 	if h.maintenanceMsg != "" {
@@ -1223,7 +1223,7 @@ func (h *Home) stackedPreviewTopY() int {
 	const helpBarHeight = 2
 	filterBarHeight := 1
 	updateBannerHeight := 0
-	if h.shouldRenderUpdateNudge() {
+	if h.shouldRenderUpdateBanner() {
 		updateBannerHeight = 1
 	}
 	maintenanceBannerHeight := 0
@@ -3041,7 +3041,7 @@ func (h *Home) syncViewport() {
 	// Filter bar is always shown for consistent layout (matches View())
 	filterBarHeight := 1
 	updateBannerHeight := 0
-	if h.shouldRenderUpdateNudge() {
+	if h.shouldRenderUpdateBanner() {
 		updateBannerHeight = 1
 	}
 	maintenanceBannerHeight := 0
@@ -3288,7 +3288,7 @@ func (h *Home) getVisibleHeight() int {
 	panelTitleLines := 2
 	filterBarHeight := 1
 	updateBannerHeight := 0
-	if h.shouldRenderUpdateNudge() {
+	if h.shouldRenderUpdateBanner() {
 		updateBannerHeight = 1
 	}
 	maintenanceBannerHeight := 0
@@ -9036,7 +9036,7 @@ func (h *Home) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 func (h *Home) getListContentStartY() int {
 	// Header: 1 line, Filter bar: 1 line
 	startY := 2
-	if h.shouldRenderUpdateNudge() {
+	if h.shouldRenderUpdateBanner() {
 		startY++ // Update banner
 	}
 	if h.maintenanceMsg != "" {
@@ -15577,7 +15577,7 @@ func (h *Home) renderFrame() string {
 	// UPDATE BANNER (if update available)
 	// ═══════════════════════════════════════════════════════════════════
 	updateBannerHeight := 0
-	if h.shouldRenderUpdateNudge() {
+	if h.shouldRenderUpdateBanner() {
 		updateBannerHeight = 1
 		updateStyle := lipgloss.NewStyle().
 			Foreground(ColorBg).
@@ -15585,7 +15585,7 @@ func (h *Home) renderFrame() string {
 			Bold(true).
 			MaxWidth(h.width).
 			Align(lipgloss.Center)
-		b.WriteString(updateStyle.Render(h.renderUpdateNudgeText()))
+		b.WriteString(updateStyle.Render(h.renderUpdateBannerText()))
 		b.WriteString("\n")
 	}
 
