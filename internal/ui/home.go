@@ -630,9 +630,14 @@ type Home struct {
 	// fleet poll). Unlike session-derived buckets it includes EMPTY groups,
 	// so the M move dialog can still offer a remote folder after every
 	// session has been moved out of it. Guarded by remoteSessionsMu.
-	remoteGroups       map[string][]string  // remoteName -> sorted group paths (incl. empty groups)
-	remoteFromCache    map[string]bool      // remoteName -> data is a startup cache snapshot, not live yet
-	remoteFetchedAt    map[string]time.Time // remoteName -> when its sessions last came from a live fetch
+	remoteGroups    map[string][]string  // remoteName -> sorted group paths (incl. empty groups)
+	remoteFromCache map[string]bool      // remoteName -> data is a startup cache snapshot, not live yet
+	remoteFetchedAt map[string]time.Time // remoteName -> when its sessions last came from a live fetch
+	// remoteVersions is what each remote last reported for `agent-deck
+	// version`, asked at most once per remoteVersionCheckInterval on the
+	// session poll and seeded from the shared cache file (#2164). Guarded
+	// by remoteSessionsMu.
+	remoteVersions     map[string]session.RemoteVersionState
 	remoteSessionsMu   sync.RWMutex
 	lastRemoteFetch    time.Time // When remote sessions were last fetched
 	remotesFetchActive bool      // Prevents overlapping fetches
@@ -1427,6 +1432,9 @@ type remoteSessionsFetchedMsg struct {
 	// The handler keeps their last-good sessions instead of wiping them,
 	// so one slow/offline remote can't flicker the whole list.
 	failed map[string]bool
+	// versions carries the `agent-deck version` answers collected this
+	// round, only for remotes whose cached answer was stale (#2164).
+	versions map[string]session.RemoteVersionState
 }
 
 // remoteLatenciesFetchedMsg is sent when an async batch of latency
@@ -1690,6 +1698,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	// Restore persisted UI state (preview mode, status filter, cursor position)
 	h.loadUIState()
 	h.loadRemoteSessionsCache()
+	h.remoteVersions = session.LoadRemoteVersions()
 
 	// Apply default_filter from config if no filter was restored from persisted state.
 	// Auto-clears if no sessions match (handled in rebuildFlatItems).
@@ -3636,6 +3645,17 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 	// #1170: track remotes that errored so the handler keeps their last-good
 	// sessions instead of dropping them.
 	failed := make(map[string]bool, len(config.Remotes))
+	// #2164: the remote's agent-deck version rides the same fanout, but only
+	// for remotes whose cached answer is older than an hour, so the header's
+	// drift marker costs one extra SSH call per hour per remote, not per tick.
+	versions := make(map[string]session.RemoteVersionState, len(config.Remotes))
+	needVersion := make(map[string]bool, len(config.Remotes))
+	h.remoteSessionsMu.RLock()
+	for name := range config.Remotes {
+		state, ok := h.remoteVersions[name]
+		needVersion[name] = remoteVersionStale(state, ok, time.Now())
+	}
+	h.remoteSessionsMu.RUnlock()
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -3681,8 +3701,19 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 			groupPaths, groupErr := runner.FetchGroupPaths(groupCtx)
 			groupCancel()
 
+			var versionState session.RemoteVersionState
+			if needVersion[name] {
+				versionCtx, versionCancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
+				version, found := runner.CheckBinary(versionCtx)
+				versionCancel()
+				versionState = session.RemoteVersionState{Version: version, Found: found, CheckedAt: time.Now()}
+			}
+
 			mu.Lock()
 			results[name] = sessions
+			if needVersion[name] {
+				versions[name] = versionState
+			}
 			if costErr == nil && summary != nil {
 				costResults[name] = summary
 			}
@@ -3699,7 +3730,7 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 	}
 	wg.Wait()
 
-	return remoteSessionsFetchedMsg{sessions: results, costs: costResults, groups: groupResults, groupsFailed: groupsFailed, failed: failed}
+	return remoteSessionsFetchedMsg{sessions: results, costs: costResults, groups: groupResults, groupsFailed: groupsFailed, failed: failed, versions: versions}
 }
 
 // mergeRemoteSessions reconciles a freshly fetched remote-session map against
@@ -6713,6 +6744,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.remotesFetchActive = false
 		h.remoteSessionsMu.Unlock()
 		h.saveRemoteSessionsCache(msg.sessions)
+		h.recordRemoteVersions(msg.versions)
 		// #1101: store remote cost summaries so renderCostLine can fold them
 		// into the displayed totals on the next paint.
 		h.remoteCostsMu.Lock()
@@ -6739,6 +6771,20 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.remoteLatencyFetchBusy = false
 		h.remoteLatencyMu.Unlock()
 		return h, nil
+
+	case remoteUpdatedMsg:
+		if msg.err != nil {
+			h.setError(fmt.Errorf("failed to update remote %s: %w", msg.remoteName, msg.err))
+			return h, nil
+		}
+		// The deploy verified the remote runs msg.to; show it now and let the
+		// next poll's hourly re-check confirm it rather than trusting a stale
+		// cached answer.
+		h.recordRemoteVersions(map[string]session.RemoteVersionState{
+			msg.remoteName: {Version: msg.to, Found: true, CheckedAt: time.Now()},
+		})
+		h.setError(fmt.Errorf("updated remote %s to v%s", msg.remoteName, msg.to))
+		return h, h.fetchRemoteSessions
 
 	case remoteSessionDeletedMsg:
 		if msg.err != nil {
@@ -10186,6 +10232,14 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Mark session as unread (idle → waiting)
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
+			// #2164: on a remote host header that runs an older release, u
+			// offers the update instead. A header without drift is a no-op.
+			if item.Type == session.ItemTypeRemoteGroup && item.Level == 0 {
+				if state, ok := h.remoteVersionState(item.RemoteName); ok && state.Outdated(Version) {
+					h.confirmDialog.ShowUpdateRemote(item.RemoteName, state.Version, Version)
+				}
+				return h, nil
+			}
 			if item.Type == session.ItemTypeSession && item.Session != nil {
 				tmuxSess := item.Session.GetTmuxSession()
 				if tmuxSess != nil {
@@ -10797,6 +10851,13 @@ func (h *Home) confirmAction() tea.Cmd {
 		title := h.confirmDialog.targetName
 		h.confirmDialog.Hide()
 		return h.closeRemoteSession(remoteName, sessionID, title)
+	case ConfirmUpdateRemote:
+		remoteName := h.confirmDialog.GetRemoteName()
+		from := h.confirmDialog.targetName
+		to := h.confirmDialog.GetTargetID()
+		h.confirmDialog.Hide()
+		h.setError(fmt.Errorf("updating remote %s to v%s…", remoteName, to))
+		return h.updateRemote(remoteName, from, to)
 	case ConfirmRemoveSession:
 		sessionID := h.confirmDialog.GetTargetID()
 		if inst := h.getInstanceByID(sessionID); inst != nil {
@@ -18332,6 +18393,7 @@ func (h *Home) renderRemoteGroupItem(b *strings.Builder, item session.Item, sele
 		running, waiting = remoteStatusCounts(sessions, "")
 	}
 	fromCache := h.remoteFromCache[item.RemoteName]
+	versionState := h.remoteVersions[item.RemoteName]
 	h.remoteSessionsMu.RUnlock()
 
 	trailer := h.renderRemoteLatencyMarker(item.RemoteName, selected)
@@ -18340,11 +18402,12 @@ func (h *Home) renderRemoteGroupItem(b *strings.Builder, item session.Item, sele
 		trailer = " " + DimStyle.Render("— cached, refreshing…")
 	}
 
-	b.WriteString(fmt.Sprintf("%s%s %s%s%s%s\n",
+	b.WriteString(fmt.Sprintf("%s%s %s%s%s%s%s\n",
 		remoteRowGutter(selected), // align with group hotkey gutter (flush with local root groups)
 		expandIcon,
 		nameStyle.Render("remotes/"+item.RemoteName),
 		countStyle.Render(fmt.Sprintf(" (%d)", count)),
+		renderRemoteVersionMarker(versionState, Version, selected), // #2164: drift marker, e.g. " v1.15.0 ↑"
 		remoteStatusSuffix(running, waiting),
 		trailer,
 	))

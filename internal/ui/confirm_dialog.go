@@ -27,6 +27,7 @@ const (
 	ConfirmUnarchiveSession
 	ConfirmNotice // acknowledge-only message (single OK button), e.g. protected-action blocks
 	ConfirmInstallHermesHooks
+	ConfirmUpdateRemote // push this controller's release to an older remote (TUI 'u' on its header, #2164)
 )
 
 // ConfirmDialog handles confirmation for destructive actions
@@ -123,6 +124,19 @@ func (c *ConfirmDialog) ShowDeleteRemoteSession(remoteName, sessionID, sessionNa
 	c.confirmType = ConfirmDeleteRemoteSession
 	c.targetID = sessionID
 	c.targetName = sessionName
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowUpdateRemote asks before deploying this controller's release (to) onto a
+// remote that reported an older one (from). targetID carries the target
+// version and targetName the current one.
+func (c *ConfirmDialog) ShowUpdateRemote(remoteName, from, to string) {
+	c.visible = true
+	c.confirmType = ConfirmUpdateRemote
+	c.targetID = to
+	c.targetName = from
 	c.remoteName = remoteName
 	c.buttonCount = 2
 	c.focusedButton = 1
@@ -431,6 +445,17 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render("y delete · n cancel · ←/→ navigate · Enter select · Esc"))
+
+	case ConfirmUpdateRemote:
+		title = "Update Remote?"
+		warning = fmt.Sprintf("Update remote %s from v%s to v%s?", c.remoteName, c.targetName, c.targetID)
+		details = "• The release archive is checksum-verified before deploy\n• The remote is re-checked afterwards; a failure leaves its current binary\n• Running sessions on the remote keep running"
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Update", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render("y update · n cancel · ←/→ navigate · Enter select · Esc"))
 
 	case ConfirmCloseRemoteSession:
 		title = "Close Remote Session?"
